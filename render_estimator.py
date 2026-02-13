@@ -1,8 +1,12 @@
 import hou
 import time
 import datetime
-import signal_cash
+import os
+import json
 import socket
+import urllib.request
+import urllib.parse
+import urllib.error
 
 # Глобальный словарь для хранения статистики рендера
 # Мы используем словарь, чтобы состояние сохранялось между вызовами функций
@@ -328,10 +332,72 @@ def finish_render():
         f"• Макс. время: {max_time_str}"
     )
     
-    print(msg)
-    
     try:
-        signal_cash.send_telegram(msg)
+        # Пытаемся отправить напрямую
+        send_telegram_notification(msg)
     except Exception as e:
         print(f"[RenderEstimator] Ошибка отправки Telegram: {e}")
+
+def load_env(env_path):
+    """
+    Простой парсер .env файла.
+    Возвращает словарь с переменными.
+    """
+    env_vars = {}
+    if os.path.exists(env_path):
+        with open(env_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, value = line.split('=', 1)
+                env_vars[key.strip()] = value.strip()
+    return env_vars
+
+def send_telegram_notification(message):
+    """
+    Отправляет сообщение в Telegram, используя .env файл для токена и chat_id.
+    """
+    # 1. Пытаемся найти .env рядом со скриптом
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    env_path = os.path.join(script_dir, '.env')
+    
+    # Если скрипт выполняется не из файла (например, в Houdini Python Source Editor),
+    # __file__ может не работать или указывать на временный файл.
+    # Попробуем жестко заданный путь или путь от HIP файла, если .env не найден
+    if not os.path.exists(env_path):
+        # Попробуем путь проекта (через HIP, если они рядом)
+        hip_dir = os.path.dirname(hou.hipFile.path())
+        env_path = os.path.join(hip_dir, '.env')
+        
+    # Если всё еще нет, проверяем рабочую директорию
+    if not os.path.exists(env_path):
+         env_path = os.path.join(os.getcwd(), '.env')
+         
+    env = load_env(env_path)
+    
+    token = env.get('TELEGRAM_BOT_TOKEN')
+    chat_id = env.get('TELEGRAM_CHAT_ID')
+    
+    if not token or not chat_id:
+        print(f"[RenderEstimator] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found in {env_path}")
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = {
+        "chat_id": chat_id,
+        "text": message
+    }
+    
+    headers = {'Content-Type': 'application/json'}
+    req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers)
+    
+    try:
+        with urllib.request.urlopen(req) as response:
+            print(f"[RenderEstimator] Telegram notification sent. Status: {response.getcode()}")
+    except urllib.error.HTTPError as e:
+        print(f"[RenderEstimator] Telegram HTTP Error: {e.code} - {e.reason}")
+        print(e.read().decode())
+    except Exception as e:
+        print(f"[RenderEstimator] Telegram Error: {e}")
 
