@@ -65,15 +65,6 @@ def start_render():
             
         render_stats['renderer'] = renderer_val
 
-        # --- Проверка режима Single Process (Batch) ---
-        # Если включено, то Houdini сначала генерирует всё, а потом рендерит одним куском.
-        # В этом случае post-frame скрипты срабатывают на этапе генерации (быстро),
-        # и статистика по кадрам будет некорректной (около 0), но общее время верное.
-        render_stats['single_process'] = False
-        if rop_node.parm('allframes') and rop_node.evalParm('allframes'):
-            render_stats['single_process'] = True
-            print("[RenderEstimator] Обнаружен режим 'Single Process'. Статистика по кадрам будет скрыта.")
-
         # --- Определение разрешения ---
         res_val = "Unknown"
         
@@ -273,25 +264,16 @@ def post_frame():
     if remaining_frames < 0:
         remaining_frames = 0
         
-    # Если Single Process, то мы замеряем время генерации, а не рендера
-    is_single_process = render_stats.get('single_process', False)
-
     # Прогноз оставшегося времени
-    if not is_single_process:
-        estimated_remaining_seconds = avg_time_per_frame * remaining_frames
-        time_str = str(datetime.timedelta(seconds=int(estimated_remaining_seconds)))
-    else:
-        time_str = "Вычисляется после рендера..."
+    estimated_remaining_seconds = avg_time_per_frame * remaining_frames
     
+    # Форматирование времени
+    time_str = str(datetime.timedelta(seconds=int(estimated_remaining_seconds)))
     elapsed_str = str(datetime.timedelta(seconds=int(elapsed_total)))
     
     # Вывод сообщения
-    if is_single_process:
-        msg = (f"[RenderEstimator] Кадр {render_stats['frames_rendered']}/{render_stats['total_frames']} отправлен на рендер (Single Process). "
-               f"Прошло: {elapsed_str}.")
-    else:
-        msg = (f"[RenderEstimator] Кадр {render_stats['frames_rendered']}/{render_stats['total_frames']} готов. "
-               f"Прошло: {elapsed_str}. Осталось: {time_str} ({avg_time_per_frame:.1f} сек/кадр)")
+    msg = (f"[RenderEstimator] Кадр {render_stats['frames_rendered']}/{render_stats['total_frames']} готов. "
+           f"Прошло: {elapsed_str}. Осталось: {time_str} ({avg_time_per_frame:.1f} сек/кадр)")
     
     print(msg)
     
@@ -322,9 +304,7 @@ def finish_render():
         avg_time = total_time / render_stats['frames_rendered']
         
         # Вычисляем мин/макс
-        is_single_process = render_stats.get('single_process', False)
-        
-        if render_stats['frame_times'] and not is_single_process:
+        if render_stats['frame_times']:
             # frame_times это список (frame, duration)
             try:
                 min_frame = min(render_stats['frame_times'], key=lambda x: x[1])
@@ -334,9 +314,6 @@ def finish_render():
                 max_time_str = f"{max_frame[1]:.1f}s ({max_frame[0]} кадр)"
             except:
                 pass
-        elif is_single_process:
-            min_time_str = "N/A (Single Process)"
-            max_time_str = "N/A (Single Process)"
     
     msg = (
         f"✅ Рендер завершен!\n\n"
@@ -354,9 +331,6 @@ def finish_render():
         f"• Мин. время: {min_time_str}\n"
         f"• Макс. время: {max_time_str}"
     )
-    
-    if render_stats.get('single_process', False):
-         msg += "\n\n⚠️ Внимание: Использовался режим Single Process. Время по кадрам не отслеживалось индивидуально, только общее время."
     
     try:
         # Пытаемся отправить напрямую
