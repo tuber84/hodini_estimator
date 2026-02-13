@@ -1,59 +1,41 @@
 import sys
-from importlib import reload
-
-# Путь к проекту (динамически от HIP файла)
-import hou
 import os
-
-# --- СТРОГАЯ КОНФИГУРАЦИЯ ЧЕРЕЗ .ENV ---
-# Скрипт требует переменную CUSTOM_SCRIPT_PATH в файле .env рядом с .hip файлом.
-# Переменная должна указывать на папку, где лежит render_estimator.py.
-# Автоматический поиск отключен для надежности.
-# ----------------------------------------
-
 import hou
-import os
-import sys
 
-# Функция для чтения .env файла (чтобы не тянуть зависимость python-dotenv в лоадеры)
-def get_custom_path_from_env(hip_dir):
-    env_path = os.path.join(hip_dir, ".env")
-    if os.path.exists(env_path):
-        try:
-            with open(env_path, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("CUSTOM_SCRIPT_PATH="):
-                        # Извлекаем значение после равно, убираем кавычки если есть
-                        path_val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        if path_val:
-                            return path_val
-        except Exception:
-            pass # Игнорируем ошибки чтения, идем по дефолту
+# Попытка найти путь к скрипту через параметры ноды
+# Так как __file__ не работает при запуске из поля Script
+def get_script_dir():
+    node = hou.pwd()
+    candidates = ['prerender', 'lprerender', 'tprerender']
+    for name in candidates:
+        parm = node.parm(name)
+        if parm:
+            val = parm.eval()
+            # Проверяем, что в параметре указан путь к ЭТОМУ скрипту
+            if 'loader_pre_render.py' in val:
+                # val может быть "C:/Path/loader_pre_render.py"
+                return os.path.dirname(val)
     return None
 
-project_path = None
-hip_dir = os.path.dirname(hou.hipFile.path())
-
-# 1. Проверяем .env файл и ТОЛЬКО его
-env_custom_path = get_custom_path_from_env(hip_dir)
-if env_custom_path and os.path.exists(os.path.join(env_custom_path, "render_estimator.py")):
-    project_path = env_custom_path
+script_dir = get_script_dir()
+if script_dir:
+    if script_dir not in sys.path:
+        sys.path.append(script_dir)
 else:
-    # Если путь не задан или неверен - ошибка
-    print(f"[RenderEstimator] CRITICAL ERROR: Could not find 'render_estimator.py'.")
-    print(f"Please set CUSTOM_SCRIPT_PATH in the .env file located at: {os.path.join(hip_dir, '.env')}")
+    # Фолбэк: пробуем найти через стандартный __file__, если вдруг запущено иначе
+    try:
+        d = os.path.dirname(os.path.abspath(__file__))
+        if d not in sys.path:
+            sys.path.append(d)
+    except:
+        pass
 
-if project_path:
-    if project_path not in sys.path:
-        sys.path.append(project_path)
-else:
-    print("[RenderEstimator] Error: Could not find render_estimator.py! Please set CUSTOM_SCRIPT_PATH in the loader script.")
-
-import render_estimator
-
-# Перезагружаем модуль на случай изменений
-reload(render_estimator)
-
-# Запускаем инициализацию рендера
-render_estimator.start_render()
+try:
+    import render_estimator
+    # Reload только для Pre-Render, чтобы подхватывать изменения кода без перезапуска Houdini
+    import importlib
+    importlib.reload(render_estimator)
+    
+    render_estimator.start_render()
+except Exception as e:
+    print(f"[Loader] Error: {e}")

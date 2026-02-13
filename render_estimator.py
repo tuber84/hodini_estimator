@@ -310,8 +310,8 @@ def finish_render():
                 min_frame = min(render_stats['frame_times'], key=lambda x: x[1])
                 max_frame = max(render_stats['frame_times'], key=lambda x: x[1])
                 
-                min_time_str = f"{min_frame[1]:.1f}s (f{min_frame[0]})"
-                max_time_str = f"{max_frame[1]:.1f}s (f{max_frame[0]})"
+                min_time_str = f"{min_frame[1]:.1f}s ({min_frame[0]} кадр)"
+                max_time_str = f"{max_frame[1]:.1f}s ({max_frame[0]} кадр)"
             except:
                 pass
     
@@ -359,13 +359,16 @@ def send_telegram_notification(message):
     Отправляет сообщение в Telegram, используя .env файл для токена и chat_id.
     """
     # 1. Пытаемся найти .env рядом со скриптом
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    env_path = os.path.join(script_dir, '.env')
+    env_path = None
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        env_path = os.path.join(script_dir, '.env')
+    except NameError:
+        # Если __file__ не определен (специфика Houdini)
+        pass
     
-    # Если скрипт выполняется не из файла (например, в Houdini Python Source Editor),
-    # __file__ может не работать или указывать на временный файл.
-    # Попробуем жестко заданный путь или путь от HIP файла, если .env не найден
-    if not os.path.exists(env_path):
+    # Если путь через __file__ не сработал или файл там не найден
+    if not env_path or not os.path.exists(env_path):
         # Попробуем путь проекта (через HIP, если они рядом)
         hip_dir = os.path.dirname(hou.hipFile.path())
         env_path = os.path.join(hip_dir, '.env')

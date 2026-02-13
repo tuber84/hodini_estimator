@@ -1,50 +1,25 @@
 import sys
-
-# Путь к проекту (динамически от HIP файла)
-import hou
 import os
-
-# --- СТРОГАЯ КОНФИГУРАЦИЯ ЧЕРЕЗ .ENV ---
-# Скрипт требует переменную CUSTOM_SCRIPT_PATH в файле .env рядом с .hip файлом.
-# Переменная должна указывать на папку, где лежит render_estimator.py.
-# Автоматический поиск отключен для надежности.
-# ----------------------------------------
-
 import hou
-import os
-import sys
 
-# Функция для чтения .env файла
-def get_custom_path_from_env(hip_dir):
-    env_path = os.path.join(hip_dir, ".env")
-    if os.path.exists(env_path):
-        try:
-            with open(env_path, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("CUSTOM_SCRIPT_PATH="):
-                        path_val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        if path_val:
-                            return path_val
-        except Exception:
-            pass
+def get_script_dir():
+    node = hou.pwd()
+    # Параметры Post-Frame
+    candidates = ['postframe', 'lpostframe', 'tpostframe']
+    for name in candidates:
+        parm = node.parm(name)
+        if parm:
+            val = parm.eval()
+            if 'loader_post_frame.py' in val:
+                return os.path.dirname(val)
     return None
 
-project_path = None
-hip_dir = os.path.dirname(hou.hipFile.path())
+script_dir = get_script_dir()
+if script_dir and script_dir not in sys.path:
+    sys.path.append(script_dir)
 
-# 1. Проверяем .env файл и ТОЛЬКО его
-env_custom_path = get_custom_path_from_env(hip_dir)
-if env_custom_path and os.path.exists(os.path.join(env_custom_path, "render_estimator.py")):
-    project_path = env_custom_path
-else:
-    print(f"[RenderEstimator] CRITICAL ERROR: Could not find 'render_estimator.py'. Please set CUSTOM_SCRIPT_PATH in .env file.")
-
-if project_path:
-    if project_path not in sys.path:
-        sys.path.append(project_path)
-
-import render_estimator
-
-# Вызываем расчет времени после кадра
-render_estimator.post_frame()
+try:
+    import render_estimator
+    render_estimator.post_frame()
+except Exception as e:
+    print(f"[Loader] Error: {e}")
