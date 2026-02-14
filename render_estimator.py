@@ -57,7 +57,10 @@ def log(message, color=Colors.RESET, icon=""):
     """
     prefix = f"{Colors.CYAN}[RenderEstimator]{Colors.RESET}"
     icon_str = f"{icon} " if icon else ""
-    print(f"{prefix} {color}{icon_str}{message}{Colors.RESET}")
+    if USE_COLORS and color:
+        print(f"{prefix} {color}{icon_str}{message}{Colors.RESET}")
+    else:
+        print(f"[RenderEstimator] {icon_str}{message}")
 
 def get_output_path_parm(node):
     """
@@ -76,11 +79,11 @@ def get_output_path_parm(node):
             return parm
     return None
 
-def file_watcher_loop(paths_to_watch, start_time):
+def file_watcher_loop(paths_to_watch, start_time, stop_event):
     """
     Фоновый поток, который следит за появлением файлов.
     """
-    global render_stats, stop_watcher_event
+    global render_stats
     
     # paths_to_watch = {frame_number: file_path}
     pending_frames = paths_to_watch.copy()
@@ -107,9 +110,36 @@ def file_watcher_loop(paths_to_watch, start_time):
         
         # Обрабатываем найденные кадры
         if completed_frames:
+            # Сортируем чтобы уведомления шли по порядку
+            completed_frames.sort()
+            
             last_activity_time = time.time()
             current_time = time.time()
-            for frame in completed_frames:
+            
+            # --- Логика усреднения времени для "пачки" кадров ---
+            # Если мы обнаружили сразу несколько кадров (например 10 штук за 1 сек),
+            # это значит что они рендерились параллельно или очень быстро.
+            # Если считать duration = current - last для каждого по очереди в цикле,
+            # то первый получит все время, а остальные 0.0s.
+            # Поэтому мы распределяем время равномерно.
+            
+            last_time_stats = render_stats['last_frame_time']
+            if last_time_stats is None: last_time_stats = render_stats['start_time']
+            
+            # Общее время, прошедшее с последнего обнаружения (или старта)
+            batch_duration_total = current_time - last_time_stats
+            
+            # Время на один кадр в этой пачке
+            # Если batch_duration_total очень мал (быстрый диск/CPU), будет малое число, но не 0 (если sleep работает)
+            if batch_duration_total < 0: batch_duration_total = 0
+            
+            frames_count = len(completed_frames)
+            avg_batch_duration = batch_duration_total / frames_count
+            
+            # Обновляем глобальное время "последнего кадра" сразу на текущее
+            render_stats['last_frame_time'] = current_time
+            
+            for i, frame in enumerate(completed_frames):
                 # Удаляем из списка ожидания
                 if frame in pending_frames:
                     # Capture path for size calculation
@@ -124,21 +154,24 @@ def file_watcher_loop(paths_to_watch, start_time):
                         pass
                 
                 # Обновляем статистику
-                last_time = render_stats['last_frame_time']
-                if last_time is None: last_time = render_stats['start_time']
+                # Для каждого кадра записываем усредненное время
+                duration = avg_batch_duration
                 
-                duration = current_time - last_time
-                render_stats['last_frame_time'] = current_time
                 render_stats['frames_rendered'] += 1
                 render_stats['frame_times'].append((frame, duration))
                 
-                # Расчет прогресса
+                # Расчет прогресса (общий)
                 elapsed = current_time - render_stats['start_time']
                 count = render_stats['frames_rendered']
                 total = render_stats['total_frames']
+                
+                # Среднее время вообще по всем кадрам
                 avg = elapsed / count if count > 0 else 0
                 rem_frames = total - count
+                if rem_frames < 0: rem_frames = 0
+                
                 rem_time = avg * rem_frames
+                if rem_time < 0: rem_time = 0
                 
                 rem_str = str(datetime.timedelta(seconds=int(rem_time)))
                 
@@ -150,14 +183,15 @@ def file_watcher_loop(paths_to_watch, start_time):
                 
                 log(msg, Colors.GREEN, "✅")
                 
-                try:
-                    # Strip colors for UI status message
-                    clean_msg = f"RenderEstimator: Frame {frame} done. Rem: {rem_str}"
-                    hou.ui.setStatusMessage(clean_msg)
-                except:
-                    pass
+                # UI Update removed to prevent thread locking/deadlocks in Houdini
+                # try:
+                #     # Strip colors for UI status message
+                #     clean_msg = f"RenderEstimator: Frame {frame} done. Rem: {rem_str}"
+                #     hou.ui.setStatusMessage(clean_msg)
+                # except:
+                #     pass
 
-    while (stop_watcher_event is not None and not stop_watcher_event.is_set()) and pending_frames:
+    while (stop_event is not None and not stop_event.is_set()) and pending_frames:
         check_for_updates()
         
         # Таймаут неактивности (10 минут)
@@ -169,13 +203,16 @@ def file_watcher_loop(paths_to_watch, start_time):
         time.sleep(1.0)
     
     # Final check for any fast frames appearing just as we stopped
-    if pending_frames:
+    # Only if NOT stopped explicitly (e.g. by restart)
+    if pending_frames and not stop_event.is_set():
         check_for_updates()
     
     log("FileWatcher finished.", Colors.BLUE, "🏁")
     
     # Отправляем финальный отчет (Watcher берет ответственность на себя)
-    finalize_and_send_report()
+    # Only if NOT stopped explicitly
+    if not stop_event.is_set():
+        finalize_and_send_report()
 
 def resolve_frame_in_path(path, frame):
     """
@@ -232,7 +269,7 @@ def try_start_file_watcher(rop):
         
         if paths_to_watch:
             stop_watcher_event = threading.Event()
-            watcher_thread = threading.Thread(target=file_watcher_loop, args=(paths_to_watch, render_stats['start_time']))
+            watcher_thread = threading.Thread(target=file_watcher_loop, args=(paths_to_watch, render_stats['start_time'], stop_watcher_event))
             watcher_thread.daemon = True
             watcher_thread.start()
             log("File Watcher started successfully (Lazy/Explicit).", Colors.GREEN, "🚀")
@@ -252,20 +289,21 @@ def start_render():
     """
     global render_stats, watcher_thread, stop_watcher_event
     
+    # Останавливаем старый поток если был - ПЕРЕД сбросом статистики
+    if stop_watcher_event:
+        stop_watcher_event.set()
+    if watcher_thread and watcher_thread.is_alive():
+        log("Waiting for previous File Watcher to stop...", Colors.YELLOW)
+        watcher_thread.join(timeout=2.0)
+        
+    watcher_thread = None
+    stop_watcher_event = None
+    
     # Сброс
     render_stats['start_time'] = time.time()
     render_stats['last_frame_time'] = time.time()
     render_stats['frames_rendered'] = 0
     render_stats['frame_times'] = []
-    
-    # Останавливаем старый поток если был
-    if stop_watcher_event:
-        stop_watcher_event.set()
-    if watcher_thread and watcher_thread.is_alive():
-        watcher_thread.join(timeout=2.0)
-        
-    watcher_thread = None
-    stop_watcher_event = None
     
     # Сохраняем информацию о сцене
     try:
@@ -561,9 +599,16 @@ def post_frame():
         out_parm = get_output_path_parm(hou.pwd())
         if out_parm:
              file_path = out_parm.evalAtFrame(current_frame)
+             
+             # Fix: Handle escaped $F manually (same as in File Watcher)
+             if file_path and '$F' in file_path:
+                 file_path = resolve_frame_in_path(file_path, current_frame)
+                 
              if file_path and os.path.exists(file_path):
                  size_bytes = os.path.getsize(file_path)
                  render_stats['total_size_bytes'] += size_bytes
+             # else:
+             #    print(f"[RenderEstimator] Debug: File not found: {file_path}")
     except Exception:
         pass
 
@@ -598,8 +643,8 @@ def post_frame():
     elapsed_str = str(datetime.timedelta(seconds=int(elapsed_total)))
     
     # Обычный режим рендера
-    msg = (f"[RenderEstimator] Кадр {render_stats['frames_rendered']}/{render_stats['total_frames']} готов. "
-           f"Прошло: {elapsed_str}. Осталось: {time_str} ({avg_time_per_frame:.1f} сек/кадр)")
+    msg = (f"[RenderEstimator] ✅ Кадр {render_stats['frames_rendered']}/{render_stats['total_frames']} готов. "
+           f"Прошло: {elapsed_str}. ⏳ Осталось: {time_str} ({avg_time_per_frame:.1f} сек/кадр)")
     
     print(msg)
     
