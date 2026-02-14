@@ -752,11 +752,14 @@ def finalize_and_send_report(title="✅ Рендер завершен!"):
         pass
         
     frames_str = format_frame_list(frame_numbers)
+    
+    # Выбираем правильное окончание
+    frames_label = "Кадр" if render_stats['total_frames'] == 1 else "Кадры"
         
     stats_block = (
         f"📊 Статистика:\n"
         f"• Всего кадров: {render_stats['total_frames']} (Рендер: {reported_frames})\n"
-        f"• Кадры: {frames_str}\n"
+        f"• {frames_label}: {frames_str}\n"
         f"• Общее время: {total_time_str}\n"
     )
     
