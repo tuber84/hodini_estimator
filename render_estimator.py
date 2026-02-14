@@ -62,6 +62,8 @@ def log(message, color=Colors.RESET, icon=""):
     else:
         print(f"[RenderEstimator] {icon_str}{message}")
 
+from utils import format_duration
+
 def get_output_path_parm(node):
     """
     Пытается найти параметр пути выходного файла.
@@ -176,10 +178,13 @@ def file_watcher_loop(paths_to_watch, start_time, stop_event):
                 rem_str = str(datetime.timedelta(seconds=int(rem_time)))
                 
                 # Formatted message
+                dur_str = format_duration(duration)
+                avg_str = format_duration(avg)
+                
                 msg = (f"Кадр {frame} готов! "
-                       f"{Colors.YELLOW}⏱ {duration:.1f}s{Colors.RESET} "
+                       f"{Colors.YELLOW}⏱ {dur_str}{Colors.RESET} "
                        f"{Colors.MAGENTA}⏳ Осталось: {rem_str}{Colors.RESET} "
-                       f"({Colors.CYAN}~{avg:.1f}s/fr{Colors.RESET})")
+                       f"({Colors.CYAN}~{avg_str}/fr{Colors.RESET})")
                 
                 log(msg, Colors.GREEN, "✅")
                 
@@ -197,7 +202,9 @@ def file_watcher_loop(paths_to_watch, start_time, stop_event):
         # Таймаут неактивности (10 минут)
         if time.time() - last_activity_time > 600:
             log("File Watcher timed out (no new frames for 10 min). Stopping.", Colors.RED, "💀")
-            break
+            # Отправляем отчет о таймауте
+            finalize_and_send_report(title="💀 File Watcher Timed Out")
+            return # Выходим и НЕ отправляем второй отчет ниже
             
         # Спим немного
         time.sleep(1.0)
@@ -269,8 +276,10 @@ def try_start_file_watcher(rop):
         
         if paths_to_watch:
             stop_watcher_event = threading.Event()
-            watcher_thread = threading.Thread(target=file_watcher_loop, args=(paths_to_watch, render_stats['start_time'], stop_watcher_event))
+            watcher_thread = threading.Thread(target=file_watcher_loop, args=(paths_to_watch, render_stats['start_time'], stop_watcher_event), name="RenderEstimator_FileWatcher_Thread")
             watcher_thread.daemon = True
+            # Прикрепляем событие к потоку для восстановления при перезагрузке
+            watcher_thread.stop_event = stop_watcher_event
             watcher_thread.start()
             log("File Watcher started successfully (Lazy/Explicit).", Colors.GREEN, "🚀")
             return True
@@ -289,12 +298,21 @@ def start_render():
     """
     global render_stats, watcher_thread, stop_watcher_event
     
-    # Останавливаем старый поток если был - ПЕРЕД сбросом статистики
-    if stop_watcher_event:
-        stop_watcher_event.set()
-    if watcher_thread and watcher_thread.is_alive():
-        log("Waiting for previous File Watcher to stop...", Colors.YELLOW)
-        watcher_thread.join(timeout=2.0)
+    # Останавливаем старый поток, если он есть (включая "фантомные" потоки после перезагрузки модуля)
+    # Ищем ВСЕ потоки с нашим именем, так как ссылка watcher_thread может быть утеряна при перезагрузке
+    for thread in threading.enumerate():
+        if thread.name == "RenderEstimator_FileWatcher_Thread":
+            log(f"Found orphaned watcher thread: {thread.name}. Stopping...", Colors.YELLOW)
+            # Пытаемся найти stop_event прикрепленный к потоку
+            if hasattr(thread, 'stop_event') and thread.stop_event:
+                thread.stop_event.set()
+            
+            # Ждем завершения
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                 log("Orphaned thread did not stop in time.", Colors.RED)
+            else:
+                 log("Orphaned thread stopped.", Colors.GREEN)
         
     watcher_thread = None
     stop_watcher_event = None
@@ -643,8 +661,9 @@ def post_frame():
     elapsed_str = str(datetime.timedelta(seconds=int(elapsed_total)))
     
     # Обычный режим рендера
+    avg_str = format_duration(avg_time_per_frame)
     msg = (f"[RenderEstimator] ✅ Кадр {render_stats['frames_rendered']}/{render_stats['total_frames']} готов. "
-           f"Прошло: {elapsed_str}. ⏳ Осталось: {time_str} ({avg_time_per_frame:.1f} сек/кадр)")
+           f"Прошло: {elapsed_str}. ⏳ Осталось: {time_str} ({avg_str}/кадр)")
     
     print(msg)
     
@@ -654,7 +673,7 @@ def post_frame():
     except:
         pass
 
-def finalize_and_send_report():
+def finalize_and_send_report(title="✅ Рендер завершен!"):
     """
     Формирует и отправляет итоговый отчет.
     Используется как FileWatcher'ом, так и finish_render'ом.
@@ -682,13 +701,14 @@ def finalize_and_send_report():
         avg_time = total_time / reported_frames
         
         # Вычисляем мин/макс
+        # Вычисляем мин/макс
         if render_stats['frame_times']:
             try:
                 min_frame = min(render_stats['frame_times'], key=lambda x: x[1])
                 max_frame = max(render_stats['frame_times'], key=lambda x: x[1])
                 
-                min_time_str = f"{min_frame[1]:.1f}s ({min_frame[0]} кадр)"
-                max_time_str = f"{max_frame[1]:.1f}s ({max_frame[0]} кадр)"
+                min_time_str = f"{format_duration(min_frame[1])} ({min_frame[0]} кадр)"
+                max_time_str = f"{format_duration(max_frame[1])} ({max_frame[0]} кадр)"
             except:
                 pass
     
@@ -698,12 +718,14 @@ def finalize_and_send_report():
         size_str = f"{total_size_mb/1024:.2f} GB"
     else:
         size_str = f"{total_size_mb:.2f} MB"
+    
+    avg_str = format_duration(avg_time)
         
     stats_block = (
         f"📊 Статистика:\n"
         f"• Всего кадров: {render_stats['total_frames']} (Рендер: {reported_frames})\n"
         f"• Общее время: {total_time_str}\n"
-        f"• Среднее на кадр: {avg_time:.1f} сек\n"
+        f"• Среднее на кадр: {avg_str}\n"
         f"• 💾 Размер: {size_str}"
     )
     
@@ -714,7 +736,7 @@ def finalize_and_send_report():
         )
 
     msg = (
-        f"✅ Рендер завершен!\n\n"
+        f"{title}\n\n"
         f"📂 Файл: {render_stats['hip_name']}\n"
         f"🕸 Нода: {render_stats['rop_name']}\n"
         f"🖥 Хост: {render_stats['hostname']}\n"
