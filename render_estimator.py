@@ -272,8 +272,14 @@ def post_frame():
     elapsed_str = str(datetime.timedelta(seconds=int(elapsed_total)))
     
     # Вывод сообщения
-    msg = (f"[RenderEstimator] Кадр {render_stats['frames_rendered']}/{render_stats['total_frames']} готов. "
-           f"Прошло: {elapsed_str}. Осталось: {time_str} ({avg_time_per_frame:.1f} сек/кадр)")
+    if avg_time_per_frame < 0.1:
+        # Если время кадра подозрительно маленькое, скорее всего это Single Process mode (генерация)
+        msg = (f"[RenderEstimator] Кадр {render_stats['frames_rendered']}/{render_stats['total_frames']}: "
+               f"Генерация сцены... (Single Process Mode)")
+    else:
+        # Обычный режим рендера
+        msg = (f"[RenderEstimator] Кадр {render_stats['frames_rendered']}/{render_stats['total_frames']} готов. "
+               f"Прошло: {elapsed_str}. Осталось: {time_str} ({avg_time_per_frame:.1f} сек/кадр)")
     
     print(msg)
     
@@ -304,7 +310,17 @@ def finish_render():
         avg_time = total_time / render_stats['frames_rendered']
         
         # Вычисляем мин/макс
-        if render_stats['frame_times']:
+        sum_frame_times = sum(t[1] for t in render_stats['frame_times'])
+        
+        # Проверка на "Render All Frames with a Single Process"
+        # В этом режиме скрипты выполняются очень быстро (генерация), а рендер идет отдельно.
+        # Если сумма времени кадров значительно меньше общего времени (например < 80%),
+        # значит мы в режиме Single Process или Batch, и индивидуальные времена кадров некорректны (0.0s).
+        is_single_process = False
+        if total_time > 1.0 and sum_frame_times < (total_time * 0.5): # 50% порог для уверенности
+            is_single_process = True
+            
+        if render_stats['frame_times'] and not is_single_process:
             # frame_times это список (frame, duration)
             try:
                 min_frame = min(render_stats['frame_times'], key=lambda x: x[1])
@@ -314,7 +330,25 @@ def finish_render():
                 max_time_str = f"{max_frame[1]:.1f}s ({max_frame[0]} кадр)"
             except:
                 pass
+        elif is_single_process:
+             # В режиме Single Process статистики по кадрам нет, поэтому мин/макс не считаем
+             min_time_str = "N/A"
+             max_time_str = "N/A"
     
+    stats_block = (
+        f"📊 Статистика:\n"
+        f"• Всего кадров: {render_stats['frames_rendered']}\n"
+        f"• Общее время: {total_time_str}\n"
+        f"• Среднее на кадр: {avg_time:.1f} сек"
+    )
+    
+    # Добавляем мин/макс только если это НЕ Single Process (где они бессмысленны)
+    if not is_single_process:
+        stats_block += (
+            f"\n• Мин. время: {min_time_str}\n"
+            f"• Макс. время: {max_time_str}"
+        )
+
     msg = (
         f"✅ Рендер завершен!\n\n"
         f"📂 Файл: {render_stats['hip_name']}\n"
@@ -324,12 +358,7 @@ def finish_render():
         f"📷 Камера: {render_stats['camera_name']}\n"
         f"💡 Свет: {', '.join(render_stats['lights'][:5]) + ('...' if len(render_stats['lights']) > 5 else '') if render_stats['lights'] else 'Не найдено'}\n"
         f"📐 Разрешение: {render_stats['resolution']}\n"
-        f"📊 Статистика:\n"
-        f"• Всего кадров: {render_stats['frames_rendered']}\n"
-        f"• Общее время: {total_time_str}\n"
-        f"• Среднее на кадр: {avg_time:.1f} сек\n"
-        f"• Мин. время: {min_time_str}\n"
-        f"• Макс. время: {max_time_str}"
+        f"{stats_block}"
     )
     
     try:
