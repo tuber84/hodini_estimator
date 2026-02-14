@@ -1,3 +1,5 @@
+import threading
+import re
 import hou
 import time
 import datetime
@@ -7,6 +9,7 @@ import socket
 import urllib.request
 import urllib.parse
 import urllib.error
+import sys
 
 # Глобальный словарь для хранения статистики рендера
 # Мы используем словарь, чтобы состояние сохранялось между вызовами функций
@@ -22,19 +25,238 @@ render_stats = {
     'renderer': "Unknown",
     'resolution': "Unknown",
     'hostname': "Unknown",
-    'lights': []
+    'lights': [],
+    'output_path': "Unknown",
+    'total_size_bytes': 0
 }
+
+# --- File Watcher Globals ---
+watcher_thread = None
+stop_watcher_event = None
+
+# --- CONFIGURATION ---
+# Check if stdout supports colors (e.g., not redirected to a file)
+# Houdini console often returns True for isatty() but doesn't support ANSI colors properly.
+# Disabling by default to avoid garbage characters.
+USE_COLORS = False
+
+class Colors:
+    RESET = "\033[0m" if USE_COLORS else ""
+    BOLD = "\033[1m" if USE_COLORS else ""
+    RED = "\033[91m" if USE_COLORS else ""
+    GREEN = "\033[92m" if USE_COLORS else ""
+    YELLOW = "\033[93m" if USE_COLORS else ""
+    BLUE = "\033[94m" if USE_COLORS else ""
+    MAGENTA = "\033[95m" if USE_COLORS else ""
+    CYAN = "\033[96m" if USE_COLORS else ""
+    WHITE = "\033[97m" if USE_COLORS else ""
+
+def log(message, color=Colors.RESET, icon=""):
+    """
+    Helper for formatted logging.
+    """
+    prefix = f"{Colors.CYAN}[RenderEstimator]{Colors.RESET}"
+    icon_str = f"{icon} " if icon else ""
+    print(f"{prefix} {color}{icon_str}{message}{Colors.RESET}")
+
+def get_output_path_parm(node):
+    """
+    Пытается найти параметр пути выходного файла.
+    Приоритет: outputimage (USD), picture (Mantra), vm_picture.
+    """
+    # Для USD/Karma приоритет outputimage
+    type_name = node.type().name()
+    if 'usd' in type_name or 'karma' in type_name:
+         p = node.parm('outputimage')
+         if p: return p
+    
+    for p in ['picture', 'outputimage', 'vm_picture', 'copoutput']:
+        parm = node.parm(p)
+        if parm:
+            return parm
+    return None
+
+def file_watcher_loop(paths_to_watch, start_time):
+    """
+    Фоновый поток, который следит за появлением файлов.
+    """
+    global render_stats, stop_watcher_event
+    
+    # paths_to_watch = {frame_number: file_path}
+    pending_frames = paths_to_watch.copy()
+    
+    log(f"FileWatcher started. Watching {len(pending_frames)} files.", Colors.BLUE, "👀")
+    
+    # Трейкинг активности для таймаута
+    last_activity_time = start_time # Use start_time initially
+    
+    def check_for_updates():
+        nonlocal last_activity_time
+        # Проверяем файлы
+        completed_frames = []
+        for frame, path in pending_frames.items():
+            if os.path.exists(path):
+                # Проверяем время модификации
+                try:
+                    mtime = os.path.getmtime(path)
+                    # Если файл изменен ПОСЛЕ старта рендера (с небольшим запасом)
+                    if mtime >= start_time - 1.0:
+                        completed_frames.append(frame)
+                except:
+                   pass
+        
+        # Обрабатываем найденные кадры
+        if completed_frames:
+            last_activity_time = time.time()
+            current_time = time.time()
+            for frame in completed_frames:
+                # Удаляем из списка ожидания
+                if frame in pending_frames:
+                    del pending_frames[frame]
+                
+                # Обновляем статистику
+                last_time = render_stats['last_frame_time']
+                if last_time is None: last_time = render_stats['start_time']
+                
+                duration = current_time - last_time
+                render_stats['last_frame_time'] = current_time
+                render_stats['frames_rendered'] += 1
+                render_stats['frame_times'].append((frame, duration))
+                
+                # Расчет прогресса
+                elapsed = current_time - render_stats['start_time']
+                count = render_stats['frames_rendered']
+                total = render_stats['total_frames']
+                avg = elapsed / count if count > 0 else 0
+                rem_frames = total - count
+                rem_time = avg * rem_frames
+                
+                rem_str = str(datetime.timedelta(seconds=int(rem_time)))
+                
+                # Formatted message
+                msg = (f"Кадр {frame} готов! "
+                       f"{Colors.YELLOW}⏱ {duration:.1f}s{Colors.RESET} "
+                       f"{Colors.MAGENTA}⏳ Осталось: {rem_str}{Colors.RESET} "
+                       f"({Colors.CYAN}~{avg:.1f}s/fr{Colors.RESET})")
+                
+                log(msg, Colors.GREEN, "✅")
+                
+                try:
+                    # Strip colors for UI status message
+                    clean_msg = f"RenderEstimator: Frame {frame} done. Rem: {rem_str}"
+                    hou.ui.setStatusMessage(clean_msg)
+                except:
+                    pass
+
+    while (stop_watcher_event is not None and not stop_watcher_event.is_set()) and pending_frames:
+        check_for_updates()
+        
+        # Таймаут неактивности (10 минут)
+        if time.time() - last_activity_time > 600:
+            log("File Watcher timed out (no new frames for 10 min). Stopping.", Colors.RED, "💀")
+            break
+            
+        # Спим немного
+        time.sleep(1.0)
+    
+    # Final check for any fast frames appearing just as we stopped
+    if pending_frames:
+        check_for_updates()
+    
+    log("FileWatcher finished.", Colors.BLUE, "🏁")
+    
+    # Отправляем финальный отчет (Watcher берет ответственность на себя)
+    finalize_and_send_report()
+
+def resolve_frame_in_path(path, frame):
+    """
+    Заменяет $F и $F<digits> на номер кадра.
+    """
+    def repl(match):
+        padding = match.group(1)
+        if padding:
+            return f"{int(frame):0{int(padding)}d}"
+        else:
+            return str(int(frame))
+    
+    # $F followed by optional digits
+    return re.sub(r'\$F(\d*)', repl, path)
+
+def try_start_file_watcher(rop):
+    """
+    Пытается запустить File Watcher.
+    Возвращает True, если watcher был запущен.
+    """
+    global render_stats, watcher_thread, stop_watcher_event
+    
+    if watcher_thread and watcher_thread.is_alive():
+        log("File Watcher already running.", Colors.YELLOW)
+        return True
+        
+    try:
+        # Проверяем, есть ли выходной файл
+        path_parm = get_output_path_parm(rop)
+        
+        if not path_parm:
+            log("Cannot find output path parameter. File Watcher skipped.", Colors.RED, "❌")
+            return False
+
+        # Генерируем пути
+        paths_to_watch = {}
+        
+        # Получаем диапазон кадров (start, end, step)
+        f_start = rop.evalParm('f1')
+        f_end = rop.evalParm('f2')
+        f_step = rop.evalParm('f3')
+        if f_step == 0: f_step = 1
+        
+        # evalAtFrame
+        curr_frame = f_start
+        while curr_frame <= f_end + 0.0001:
+            path = path_parm.evalAtFrame(curr_frame)
+            # Fix: Если в пути остались $F (из-за экранирования \$F для USD), заменяем их вручную
+            if '$F' in path:
+                path = resolve_frame_in_path(path, curr_frame)
+            
+            paths_to_watch[int(curr_frame)] = path
+            curr_frame += f_step
+        
+        if paths_to_watch:
+            stop_watcher_event = threading.Event()
+            watcher_thread = threading.Thread(target=file_watcher_loop, args=(paths_to_watch, render_stats['start_time']))
+            watcher_thread.daemon = True
+            watcher_thread.start()
+            log("File Watcher started successfully (Lazy/Explicit).", Colors.GREEN, "🚀")
+            return True
+        else:
+             log("No paths to watch generated.", Colors.YELLOW)
+             return False
+
+    except Exception as e:
+        log(f"Error starting File Watcher: {e}", Colors.RED, "💥")
+        return False
 
 def start_render():
     """
     Функция для 'Pre-Render Script'.
     Инициализирует статистику перед началом рендера.
     """
-    global render_stats
+    global render_stats, watcher_thread, stop_watcher_event
+    
+    # Сброс
     render_stats['start_time'] = time.time()
     render_stats['last_frame_time'] = time.time()
     render_stats['frames_rendered'] = 0
     render_stats['frame_times'] = []
+    
+    # Останавливаем старый поток если был
+    if stop_watcher_event:
+        stop_watcher_event.set()
+    if watcher_thread and watcher_thread.is_alive():
+        watcher_thread.join(timeout=2.0)
+        
+    watcher_thread = None
+    stop_watcher_event = None
     
     # Сохраняем информацию о сцене
     try:
@@ -65,22 +287,53 @@ def start_render():
             
         render_stats['renderer'] = renderer_val
 
+        # --- Output Path ---
+        out_parm = get_output_path_parm(rop_node)
+        if out_parm:
+            try:
+                # Store unexpanded string to show variables like $F
+                val = out_parm.unexpandedString()
+                if not val: val = out_parm.eval()
+                render_stats['output_path'] = val
+            except:
+                render_stats['output_path'] = "Unknown"
+        else:
+            render_stats['output_path'] = "Unknown"
+
         # --- Определение разрешения ---
         res_val = "Unknown"
+        res_source = "None"
         
+        # Debug params
+
+
         # 1. Стандартные паметры (Mantra/Redshift/Standard ROPs)
         if rop_node.parm('resx') and rop_node.parm('resy'):
              res_val = f"{rop_node.evalParm('resx')}x{rop_node.evalParm('resy')}"
+             res_source = "ROP resx/resy"
         elif rop_node.parm('tres1') and rop_node.parm('tres2'): # Иногда так называется
              res_val = f"{rop_node.evalParm('tres1')}x{rop_node.evalParm('tres2')}"
+             res_source = "ROP tres"
         
         # 2. Переопределения в Solaris (Karma ROP)
-        # Если есть override_resolution (и он включен или просто существует как единственное место)
-        if res_val == "Unknown":
-            if rop_node.parm('override_resolution') and rop_node.evalParm('override_resolution'):
+        # Если есть override_resolution (и он включен)
+        # Karma ROP часто имеет resolution (res1, res2)
+        if rop_node.parm('override_resolution'):
+            is_overridden = rop_node.evalParm('override_resolution')
+            if is_overridden:
                  if rop_node.parm('res1') and rop_node.parm('res2'):
                      res_val = f"{rop_node.evalParm('res1')}x{rop_node.evalParm('res2')}"
+                     res_source = "ROP Override"
+            else:
+                # Если override ВЫКЛЮЧЕН, мы должны игнорировать локальные параметры ROP
+                # и искать в USD.
+                # Если мы уже нашли что-то через resx/tres, нужно сбросить, если мы уверены, что это Solaris
+                if 'karma' in render_stats['renderer'].lower() or 'usd' in render_stats['renderer'].lower():
+                    # log("Override is OFF. Ignoring ROP params, looking in USD...", Colors.CYAN)
+                    res_val = "Unknown"
+                    res_source = "Forced USD lookup"
         
+
         render_stats['resolution'] = res_val # Предварительно сохраняем, может обновиться через USD
 
         # --- Поиск камеры и доп. данных через USD ---
@@ -137,6 +390,7 @@ def start_render():
                                         if res_vec:
                                             # res_vec обычно Gf.Vec2i
                                             render_stats['resolution'] = f"{res_vec[0]}x{res_vec[1]}"
+
                 except Exception as e:
                     # print(f"[RenderEstimator] USD extraction error: {e}")
                     pass
@@ -221,9 +475,24 @@ def start_render():
         
         print(f"[RenderEstimator] Начало рендера. Кадров: {render_stats['total_frames']}")
         
+        # --- ЗАПУСК FILE WATCHER ---
+        should_start_watcher = False
+        # Пробуем несколько вариантов имен параметров
+        sp_parms = ['husk_all_frames_in_one_process', 'tr_all_frames_in_one_process', 'all_frames_in_one_process', 'allframesatonce']
+        for p_name in sp_parms:
+            if rop.parm(p_name) and rop.evalParm(p_name):
+                should_start_watcher = True
+                print(f"[RenderEstimator] Detected 'Single Process' mode via {p_name}.")
+                break
+        
+        if not should_start_watcher:
+             print("[RenderEstimator] 'Single Process' flag not found. File Watcher will NOT start explicitly.")
+             
+        if should_start_watcher:
+            try_start_file_watcher(rop)
+            
     except Exception as e:
         print(f"[RenderEstimator] Ошибка при инициализации: {e}")
-        # Если не удалось получить данные, ставим дефолт (бесконечность или 0)
         render_stats['total_frames'] = 0
 
 def post_frame():
@@ -238,13 +507,61 @@ def post_frame():
         return
 
     current_time = time.time()
+    
+    # В Single Process режиме этот скрипт вызывается ОЧЕНЬ быстро во время генерации.
+    # Мы не хотим, чтобы он портил статистику "фейковыми" быстрыми кадрами, 
+    # ЕСЛИ у нас работает File Watcher.
+    
+    # Время последнего кадра (или старта)
+    last_t = render_stats['last_frame_time']
+    if last_t is None: last_t = render_stats['start_time']
+    frame_duration = current_time - last_t
+    
+    # --- LAZY START WATCHER ---
+    # Если кадры летят очень быстро (генерация USD), а Watcher не работает
+    if frame_duration < 0.2 and not watcher_thread:
+         print(f"[RenderEstimator] Fast frame detected ({frame_duration:.4f}s). Attempting LAZY START of File Watcher...")
+         # Пытаемся запустить
+         if try_start_file_watcher(hou.pwd()):
+             # Если запустился, то выходим, чтобы не портить статистику первыми быстрыми кадрами
+             # (Watcher сам найдет файлы)
+             print("[RenderEstimator] Lazy start successful. Handing over to File Watcher.")
+             render_stats['last_frame_time'] = current_time
+             return
+         else:
+             print("[RenderEstimator] Lazy start failed.")
+
+    # Если watcher работает, мы игнорируем быстрые вызовы post_frame
+    if watcher_thread and watcher_thread.is_alive():
+        # Если это реально генерация
+        if frame_duration < 0.5:
+            # print(f"[RenderEstimator] Generating scene... (Watcher Active)")
+            render_stats['last_frame_time'] = current_time
+            return
+        else:
+             # Если это НЕ генерация (вдруг?), но вотчер работает...
+             # Лучше довериться вотчеру, если он включен.
+             render_stats['last_frame_time'] = current_time
+             return
+
+    # Обычный режим (без Watcher)
+    
+    # --- File Size Tracking ---
+    try:
+        current_frame = int(hou.frame())
+        out_parm = get_output_path_parm(hou.pwd())
+        if out_parm:
+             file_path = out_parm.evalAtFrame(current_frame)
+             if file_path and os.path.exists(file_path):
+                 size_bytes = os.path.getsize(file_path)
+                 render_stats['total_size_bytes'] += size_bytes
+    except Exception:
+        pass
+
     render_stats['frames_rendered'] += 1
     
     # Время с начала рендера
     elapsed_total = current_time - render_stats['start_time']
-    
-    # Время последнего кадра
-    frame_duration = current_time - render_stats['last_frame_time']
     render_stats['last_frame_time'] = current_time
     
     # Сохраняем статистику по кадру
@@ -271,15 +588,9 @@ def post_frame():
     time_str = str(datetime.timedelta(seconds=int(estimated_remaining_seconds)))
     elapsed_str = str(datetime.timedelta(seconds=int(elapsed_total)))
     
-    # Вывод сообщения
-    if avg_time_per_frame < 0.1:
-        # Если время кадра подозрительно маленькое, скорее всего это Single Process mode (генерация)
-        msg = (f"[RenderEstimator] Кадр {render_stats['frames_rendered']}/{render_stats['total_frames']}: "
-               f"Генерация сцены... (Single Process Mode)")
-    else:
-        # Обычный режим рендера
-        msg = (f"[RenderEstimator] Кадр {render_stats['frames_rendered']}/{render_stats['total_frames']} готов. "
-               f"Прошло: {elapsed_str}. Осталось: {time_str} ({avg_time_per_frame:.1f} сек/кадр)")
+    # Обычный режим рендера
+    msg = (f"[RenderEstimator] Кадр {render_stats['frames_rendered']}/{render_stats['total_frames']} готов. "
+           f"Прошло: {elapsed_str}. Осталось: {time_str} ({avg_time_per_frame:.1f} сек/кадр)")
     
     print(msg)
     
@@ -289,10 +600,10 @@ def post_frame():
     except:
         pass
 
-def finish_render():
+def finalize_and_send_report():
     """
-    Функция для 'Post-Render Script'.
-    Отправляет итоговую статистику в Telegram.
+    Формирует и отправляет итоговый отчет.
+    Используется как FileWatcher'ом, так и finish_render'ом.
     """
     global render_stats
     
@@ -306,22 +617,18 @@ def finish_render():
     min_time_str = "N/A"
     max_time_str = "N/A"
     
-    if render_stats['frames_rendered'] > 0:
-        avg_time = total_time / render_stats['frames_rendered']
+    # Определяем, сколько кадров реально готово
+    reported_frames = render_stats['frames_rendered']
+    
+    # Фолбэк logic: Если frames_rendered 0, но прошло много времени и total_frames > 0
+    if reported_frames == 0 and total_time > 10 and render_stats['total_frames'] > 0:
+         reported_frames = render_stats['total_frames']
+
+    if reported_frames > 0:
+        avg_time = total_time / reported_frames
         
         # Вычисляем мин/макс
-        sum_frame_times = sum(t[1] for t in render_stats['frame_times'])
-        
-        # Проверка на "Render All Frames with a Single Process"
-        # В этом режиме скрипты выполняются очень быстро (генерация), а рендер идет отдельно.
-        # Если сумма времени кадров значительно меньше общего времени (например < 80%),
-        # значит мы в режиме Single Process или Batch, и индивидуальные времена кадров некорректны (0.0s).
-        is_single_process = False
-        if total_time > 1.0 and sum_frame_times < (total_time * 0.5): # 50% порог для уверенности
-            is_single_process = True
-            
-        if render_stats['frame_times'] and not is_single_process:
-            # frame_times это список (frame, duration)
+        if render_stats['frame_times']:
             try:
                 min_frame = min(render_stats['frame_times'], key=lambda x: x[1])
                 max_frame = max(render_stats['frame_times'], key=lambda x: x[1])
@@ -330,20 +637,15 @@ def finish_render():
                 max_time_str = f"{max_frame[1]:.1f}s ({max_frame[0]} кадр)"
             except:
                 pass
-        elif is_single_process:
-             # В режиме Single Process статистики по кадрам нет, поэтому мин/макс не считаем
-             min_time_str = "N/A"
-             max_time_str = "N/A"
     
     stats_block = (
         f"📊 Статистика:\n"
-        f"• Всего кадров: {render_stats['frames_rendered']}\n"
+        f"• Всего кадров: {render_stats['total_frames']} (Рендер: {reported_frames})\n"
         f"• Общее время: {total_time_str}\n"
         f"• Среднее на кадр: {avg_time:.1f} сек"
     )
     
-    # Добавляем мин/макс только если это НЕ Single Process (где они бессмысленны)
-    if not is_single_process:
+    if min_time_str != "N/A":
         stats_block += (
             f"\n• Мин. время: {min_time_str}\n"
             f"• Макс. время: {max_time_str}"
@@ -362,10 +664,43 @@ def finish_render():
     )
     
     try:
-        # Пытаемся отправить напрямую
         send_telegram_notification(msg)
     except Exception as e:
         print(f"[RenderEstimator] Ошибка отправки Telegram: {e}")
+
+
+def finish_render():
+    """
+    Функция для 'Post-Render Script'.
+    """
+    global render_stats, watcher_thread, stop_watcher_event
+    
+    # Если Watcher работает
+    if watcher_thread and watcher_thread.is_alive():
+        # Проверяем, есть ли еще кадры для ожидания (в pending_frames внутри watcher thread)
+        # Но pending_frames локальная переменная.
+        # Мы можем косвенно проверить: frames_rendered < total_frames?
+        # Или просто довериться Watcher'у.
+        
+        # Если это Detached render, watcher должен продолжать работу.
+        # Если мы здесь, значит ROP "завершил" работу (или инициировал post-render).
+        
+        # ПРАВИЛО: Если Watcher запущен, ОН отвечает за отправку отчета.
+        # finish_render просто выходит, чтобы не мешать, если watcher еще ждет файлы.
+        
+        # Единственный нюанс: как остановить watcher если пользователь ОТМЕНИЛ рендер?
+        # Мы не знаем точно. Пусть watcher отвалится по таймауту или когда найдет файлы.
+        
+        print("[RenderEstimator] finish_render called. Handing over final report to active File Watcher.")
+        
+        # Если мы уверены, что рендер ВСЕ (все кадры найдены), можно ускорить выход watcher
+        # Но у нас нет доступа к pending_frames из этого скоупа легко (без переделки в класс).
+        # Поэтому просто выходим.
+        return
+
+    # Если watcher не работает (обычный рендер), отправляем сами
+    finalize_and_send_report()
+
 
 def load_env(env_path):
     """
@@ -382,6 +717,7 @@ def load_env(env_path):
                 key, value = line.split('=', 1)
                 env_vars[key.strip()] = value.strip()
     return env_vars
+
 
 def send_telegram_notification(message):
     """
