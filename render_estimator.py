@@ -112,7 +112,16 @@ def file_watcher_loop(paths_to_watch, start_time):
             for frame in completed_frames:
                 # Удаляем из списка ожидания
                 if frame in pending_frames:
+                    # Capture path for size calculation
+                    f_path = pending_frames[frame]
                     del pending_frames[frame]
+                    
+                    try:
+                        if os.path.exists(f_path):
+                            s_bytes = os.path.getsize(f_path)
+                            render_stats['total_size_bytes'] += s_bytes
+                    except:
+                        pass
                 
                 # Обновляем статистику
                 last_time = render_stats['last_frame_time']
@@ -638,11 +647,19 @@ def finalize_and_send_report():
             except:
                 pass
     
+    # Расчет размера
+    total_size_mb = render_stats.get('total_size_bytes', 0) / (1024 * 1024)
+    if total_size_mb > 1024:
+        size_str = f"{total_size_mb/1024:.2f} GB"
+    else:
+        size_str = f"{total_size_mb:.2f} MB"
+        
     stats_block = (
         f"📊 Статистика:\n"
         f"• Всего кадров: {render_stats['total_frames']} (Рендер: {reported_frames})\n"
         f"• Общее время: {total_time_str}\n"
-        f"• Среднее на кадр: {avg_time:.1f} сек"
+        f"• Среднее на кадр: {avg_time:.1f} сек\n"
+        f"• 💾 Размер: {size_str}"
     )
     
     if min_time_str != "N/A":
@@ -660,6 +677,7 @@ def finalize_and_send_report():
         f"📷 Камера: {render_stats['camera_name']}\n"
         f"💡 Свет: {', '.join(render_stats['lights'][:5]) + ('...' if len(render_stats['lights']) > 5 else '') if render_stats['lights'] else 'Не найдено'}\n"
         f"📐 Разрешение: {render_stats['resolution']}\n"
+        f"📂 Путь: {render_stats.get('output_path', 'Unknown')}\n"
         f"{stats_block}"
     )
     
