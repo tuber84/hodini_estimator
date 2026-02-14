@@ -62,7 +62,10 @@ def log(message, color=Colors.RESET, icon=""):
     else:
         print(f"[RenderEstimator] {icon_str}{message}")
 
-from utils import format_duration
+import importlib
+import utils
+importlib.reload(utils)
+from utils import format_duration, format_frame_list
 
 def get_output_path_parm(node):
     """
@@ -257,11 +260,8 @@ def try_start_file_watcher(rop):
         # Генерируем пути
         paths_to_watch = {}
         
-        # Получаем диапазон кадров (start, end, step)
-        f_start = rop.evalParm('f1')
-        f_end = rop.evalParm('f2')
-        f_step = rop.evalParm('f3')
-        if f_step == 0: f_step = 1
+        # Получаем диапазон кадров с учетом trange
+        f_start, f_end, f_step = get_frame_range(rop)
         
         # evalAtFrame
         curr_frame = f_start
@@ -290,6 +290,31 @@ def try_start_file_watcher(rop):
     except Exception as e:
         log(f"Error starting File Watcher: {e}", Colors.RED, "💥")
         return False
+
+def get_frame_range(rop):
+    """
+    Возвращает (start, end, step) с учетом параметра 'trange' (Valid Frame Range).
+    trange:
+    0 = Render Current Frame
+    1 = Render Frame Range
+    2 = Render Frame Range Only (Strict)
+    """
+    f_start = rop.evalParm('f1')
+    f_end = rop.evalParm('f2')
+    f_step = rop.evalParm('f3')
+    
+    # Check trange (Render Current Frame vs Range)
+    trange = rop.evalParm('trange')
+    
+    # If "Render Current Frame" (0)
+    if trange == 0:
+        f_start = hou.frame()
+        f_end = hou.frame()
+        f_step = 1
+        
+    if f_step == 0: f_step = 1
+    
+    return f_start, f_end, f_step
 
 def start_render():
     """
@@ -351,7 +376,7 @@ def start_render():
             else: renderer_val = type_name
             
         render_stats['renderer'] = renderer_val
-
+        
         # --- Output Path ---
         out_parm = get_output_path_parm(rop_node)
         if out_parm:
@@ -529,13 +554,10 @@ def start_render():
         # hou.pwd() возвращает текущую ноду (ROP)
         rop = hou.pwd()
         
-        # Получаем диапазон кадров (start, end, step)
-        f_start = rop.evalParm('f1')
-        f_end = rop.evalParm('f2')
-        f_step = rop.evalParm('f3')
+        # Получаем диапазон кадров с учетом trange
+        f_start, f_end, f_step = get_frame_range(rop)
         
         # Вычисляем общее количество кадров
-        if f_step == 0: f_step = 1 # Защита от деления на ноль
         render_stats['total_frames'] = int((f_end - f_start) / f_step) + 1
         
         print(f"[RenderEstimator] Начало рендера. Кадров: {render_stats['total_frames']}")
@@ -584,6 +606,7 @@ def post_frame():
     
     # --- LAZY START WATCHER ---
     # Если кадры летят очень быстро (генерация USD), а Watcher не работает
+    # (Даже если кадр один - это может быть запуск фонового процесса, так что ловим его)
     if frame_duration < 0.2 and not watcher_thread:
          print(f"[RenderEstimator] Fast frame detected ({frame_duration:.4f}s). Attempting LAZY START of File Watcher...")
          # Пытаемся запустить
@@ -720,16 +743,31 @@ def finalize_and_send_report(title="✅ Рендер завершен!"):
         size_str = f"{total_size_mb:.2f} MB"
     
     avg_str = format_duration(avg_time)
+    
+    # Формируем список кадров
+    frame_numbers = [x[0] for x in render_stats['frame_times']]
+    # Если рендерился 1 кадр, но список пуст (быстрый рендер), добавим текущий
+    if not frame_numbers and render_stats['total_frames'] == 1:
+        # Пытаемся взять из ROP, но проще просто не показывать, если не знаем
+        pass
+        
+    frames_str = format_frame_list(frame_numbers)
         
     stats_block = (
         f"📊 Статистика:\n"
         f"• Всего кадров: {render_stats['total_frames']} (Рендер: {reported_frames})\n"
+        f"• Кадры: {frames_str}\n"
         f"• Общее время: {total_time_str}\n"
-        f"• Среднее на кадр: {avg_str}\n"
-        f"• 💾 Размер: {size_str}"
     )
     
-    if min_time_str != "N/A":
+    # Добавляем среднее, только если кадров > 1
+    if render_stats['total_frames'] > 1:
+        stats_block += f"• Среднее на кадр: {avg_str}\n"
+        
+    stats_block += f"• 💾 Размер: {size_str}"
+    
+    # Добавляем мин/макс только если кадров > 1 и они есть
+    if render_stats['total_frames'] > 1 and min_time_str != "N/A":
         stats_block += (
             f"\n• Мин. время: {min_time_str}\n"
             f"• Макс. время: {max_time_str}"
