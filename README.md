@@ -1,3 +1,5 @@
+🇷🇺 [Русский](README.md) | 🇬🇧 [English](README_en.md)
+
 # Houdini Render Estimator & Telegram Notifier
 
 Этот набор скриптов для Houdini позволяет оценивать время рендера и отправлять уведомления в Telegram по завершению задачи.
